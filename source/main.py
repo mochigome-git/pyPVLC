@@ -181,9 +181,7 @@ class LogAnalyzerApp:
         """ This function is executed in a separate thread """
         try:
             # Simulate a delay for loading the log file (e.g., reading from disk)
-            # If you want to read from the file, do it here.
             if os.path.isfile(self.file_path):
-                # Log file loading logic can be added here if needed
                 messagebox.showinfo("Log File Loaded", f"Loaded log file from configuration: {os.path.basename(self.file_path)}")
             else:
                 messagebox.showwarning("File Not Found", "The log file path is invalid.")
