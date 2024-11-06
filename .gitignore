@@ -1,0 +1,10 @@
+# Ignore .env files
+.env
+*.env
+
+# Ignore any "Activity logs" directory 
+Activity logs/
+
+# Ignore build and dist directories
+build/
+dist/
