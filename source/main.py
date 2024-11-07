@@ -300,7 +300,7 @@ class LogAnalyzerApp:
                           f"Verified: {verified}\n")
 
         post_success = False
-        if verified <= programmed:
+        if programmed >= job_quantity:
             if verified >= job_quantity:
                 result_message += "\nCondition met. Attempting to post data to the database."
                 post_success = self.post_to_database(job, job_quantity, programmed, verified)
@@ -320,7 +320,7 @@ class LogAnalyzerApp:
                 result_message += "\nCondition not met: Verified count is less than job quantity."
                 show_custom_message("Condition Not Met", result_message, "close.png")
         else:
-            result_message += "\nCondition not met: Verified count is less than programmed count."
+            result_message += "\nCondition not met: Programmed count is less than job count."
             show_custom_message("Condition Not Met", result_message, "close.png")
 
 if __name__ == "__main__":
