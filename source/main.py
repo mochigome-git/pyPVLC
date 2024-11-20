@@ -36,6 +36,8 @@ import tkinter as tk
 import configparser
 import threading
 import stat
+import boto3
+from datetime import datetime
 from tkinter import filedialog, messagebox
 from dotenv import load_dotenv
 from PIL import Image, ImageTk  
@@ -47,6 +49,69 @@ load_dotenv()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Retrieve credentials from environment variables
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION")
+
+# Initialize the S3 client
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=AWS_DEFAULT_REGION
+)
+
+def upload_to_s3(data, job, job_quantity):
+    """
+    Uploads data to an S3 bucket with a dynamically generated filename.
+    If a file with the same name exists, a sequence number is added to the filename.
+
+    :param data: The content/data to be uploaded to S3.
+    :param job: A descriptive identifier for the job.
+    :param job_quantity: The quantity of the job to help form the file name.
+    """
+    # Retrieve bucket name from environment variables
+    bucket_name = os.environ.get('BUCKET_NAME')
+
+    # Generate a timestamp-based filename
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    base_file_name = f"logs/{current_date}-{job}-{job_quantity}.txt"
+
+    if not bucket_name:
+        print("BUCKET_NAME must be set in the environment variables.")
+        return
+
+    # Check if the file already exists
+    sequence = 1
+    file_name = base_file_name
+    while check_file_exists(s3, bucket_name, file_name):
+        # If file exists, increment the sequence number and try again
+        file_name = f"logs/{current_date}-{job}-{job_quantity}-{sequence}.txt"
+        sequence += 1
+
+    try:
+        # Upload the data
+        s3.put_object(Bucket=bucket_name, Key=file_name, Body=data)
+        print(f"Data uploaded to S3 successfully with the name: {file_name}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+def check_file_exists(s3_client, bucket_name, file_name):
+    """
+    Check if a file exists in the S3 bucket.
+
+    :param s3_client: The boto3 S3 client.
+    :param bucket_name: The name of the S3 bucket.
+    :param file_name: The name of the file to check.
+    :return: True if the file exists, False otherwise.
+    """
+    try:
+        s3_client.head_object(Bucket=bucket_name, Key=file_name)
+        return True  # File exists
+    except s3_client.exceptions.ClientError:
+        return False  # File does not exist
 
 # Function to display a custom message box
 def show_custom_message(title, message, icon_path=None):
@@ -242,7 +307,7 @@ class LogAnalyzerApp:
         except Exception as exception:
             print("An error occurred:", exception)
             return False
-
+        
     def analyze_and_post(self):
         """
         Posts data to the Supabase database for tracking job and verification details.
@@ -309,6 +374,8 @@ class LogAnalyzerApp:
                     show_custom_message("Success", result_message, "accept.png")                      
                     # Delete log file after successful post
                     try:
+                        upload_to_s3(self.file_path, job, job_quantity)
+                        messagebox.showinfo("Log File Uploaded", "Data uploaded to S3 successfully.")
                         delete_log_file(self.file_path)
                         messagebox.showinfo("Log File Deleted", "The log file has been deleted successfully.")
                     except Exception as e:
