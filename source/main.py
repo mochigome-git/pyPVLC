@@ -374,10 +374,14 @@ class LogAnalyzerApp:
                     show_custom_message("Success", result_message, "accept.png")                      
                     # Delete log file after successful post
                     try:
-                        upload_to_s3(self.file_path, job, job_quantity)
+                        with open(self.file_path, 'rb') as file:
+                            file_content = file.read()
+                        upload_to_s3(file_content, job, job_quantity)
                         messagebox.showinfo("Log File Uploaded", "Data uploaded to S3 successfully.")
                         delete_log_file(self.file_path)
                         messagebox.showinfo("Log File Deleted", "The log file has been deleted successfully.")
+                    except FileNotFoundError:
+                        print(f"File not found: {self.file_path}")
                     except Exception as e:
                         print(f"Error deleting log file: {e}")
                 else:
