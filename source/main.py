@@ -367,11 +367,18 @@ class LogAnalyzerApp:
         post_success = False
         if programmed >= job_quantity:
             if verified >= job_quantity:
+                # Alert if programmed or verified exceeds job_quantity by more than 10
+                if programmed > job_quantity + 10 or verified > job_quantity + 10:
+                    messagebox.showinfo(
+                        "Alert", 
+                        "The difference between the counts and job quantity is more than 10. Please review."
+                    )
+                
                 result_message += "\nCondition met. Attempting to post data to the database."
                 post_success = self.post_to_database(job, job_quantity, programmed, verified)
                 if post_success:
                     result_message += "\nData successfully posted to the database."
-                    show_custom_message("Success", result_message, "accept.png")                      
+                    show_custom_message("Success", result_message, "accept.png")
                     # Delete log file after successful post
                     try:
                         with open(self.file_path, 'rb') as file:
@@ -393,6 +400,7 @@ class LogAnalyzerApp:
         else:
             result_message += "\nCondition not met: Programmed count is less than job count."
             show_custom_message("Condition Not Met", result_message, "close.png")
+
 
 if __name__ == "__main__":
     root = tk.Tk()
