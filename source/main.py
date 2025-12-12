@@ -63,40 +63,51 @@ s3 = boto3.client(
     region_name=AWS_DEFAULT_REGION
 )
 
-def upload_to_s3(data, job, job_quantity):
+def upload_to_s3(s3_client, data, job, job_quantity):
     """
     Uploads data to an S3 bucket with a dynamically generated filename.
     If a file with the same name exists, a sequence number is added to the filename.
+    Verifies the upload by re-checking object existence.
 
     :param data: The content/data to be uploaded to S3.
     :param job: A descriptive identifier for the job.
     :param job_quantity: The quantity of the job to help form the file name.
+
+    Returns:
+    (success: bool, file_name: str or None)
     """
     # Retrieve bucket name from environment variables
     bucket_name = os.environ.get('BUCKET_NAME')
+    if not bucket_name:
+        print("BUCKET_NAME must be set in the environment variables.")
+        return False, None
 
-    # Generate a timestamp-based filename
+    # Generate base name
     current_date = datetime.now().strftime("%Y-%m-%d")
     base_file_name = f"logs/{current_date}-{job}-{job_quantity}.txt"
 
-    if not bucket_name:
-        print("BUCKET_NAME must be set in the environment variables.")
-        return
-
-    # Check if the file already exists
+    # Find non-conflicting filename
     sequence = 1
     file_name = base_file_name
-    while check_file_exists(s3, bucket_name, file_name):
-        # If file exists, increment the sequence number and try again
+    while check_file_exists(s3_client, bucket_name, file_name):
         file_name = f"logs/{current_date}-{job}-{job_quantity}-{sequence}.txt"
         sequence += 1
 
     try:
         # Upload the data
-        s3.put_object(Bucket=bucket_name, Key=file_name, Body=data)
-        print(f"Data uploaded to S3 successfully with the name: {file_name}")
+        s3_client.put_object(Bucket=bucket_name, Key=file_name, Body=data)
+
+        # Verify the upload by checking the object again
+        if not check_file_exists(s3_client, bucket_name, file_name):
+            print("Upload failed verification — file does not exist in S3.")
+            return False, None
+
+        print(f"Verified upload OK → {file_name}")
+        return True, file_name
+
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"[ERROR] Upload failed: {e}")
+        return False, None
 
 def check_file_exists(s3_client, bucket_name, file_name):
     """
@@ -383,10 +394,15 @@ class LogAnalyzerApp:
                     try:
                         with open(self.file_path, 'rb') as file:
                             file_content = file.read()
-                        upload_to_s3(file_content, job, job_quantity)
-                        messagebox.showinfo("Log File Uploaded", "Data uploaded to S3 successfully.")
-                        delete_log_file(self.file_path)
-                        messagebox.showinfo("Log File Deleted", "The log file has been deleted successfully.")
+                        success, s3_file_name = upload_to_s3(s3, file_content, job, job_quantity)
+
+                        if success:
+                            messagebox.showinfo("Log File Uploaded", f"Data uploaded to S3 successfully:\n{s3_file_name}")
+                            delete_log_file(self.file_path)
+                            messagebox.showinfo("Log File Deleted", "The log file has been deleted successfully.")
+                        else:
+                            messagebox.showerror("Upload Failed", "Failed to upload data to S3. Log file was NOT deleted.")
+
                     except FileNotFoundError:
                         print(f"File not found: {self.file_path}")
                     except Exception as e:
