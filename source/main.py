@@ -40,10 +40,15 @@ import boto3
 from datetime import datetime
 from tkinter import filedialog, messagebox
 from dotenv import load_dotenv
-from PIL import Image, ImageTk  
+from PIL import Image, ImageTk
 from supabase import create_client, Client
+from botocore.exceptions import (
+    ClientError,
+    BotoCoreError,
+    NoCredentialsError,
+    PartialCredentialsError,
+)
 
-# Supabase credentials
 # Load environment variables from .env file
 load_dotenv()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -57,11 +62,12 @@ AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION")
 
 # Initialize the S3 client
 s3 = boto3.client(
-    's3',
+    "s3",
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_DEFAULT_REGION
+    region_name=AWS_DEFAULT_REGION,
 )
+
 
 def upload_to_s3(s3_client, data, job, job_quantity):
     """
@@ -69,18 +75,14 @@ def upload_to_s3(s3_client, data, job, job_quantity):
     If a file with the same name exists, a sequence number is added to the filename.
     Verifies the upload by re-checking object existence.
 
-    :param data: The content/data to be uploaded to S3.
-    :param job: A descriptive identifier for the job.
-    :param job_quantity: The quantity of the job to help form the file name.
-
     Returns:
-    (success: bool, file_name: str or None)
+    (success: bool, file_name: str or None, error_message: str or None)
     """
-    # Retrieve bucket name from environment variables
-    bucket_name = os.environ.get('BUCKET_NAME')
+    bucket_name = os.environ.get("BUCKET_NAME")
     if not bucket_name:
-        print("BUCKET_NAME must be set in the environment variables.")
-        return False, None
+        error_msg = "BUCKET_NAME must be set in the environment variables."
+        print(error_msg)
+        return False, None, error_msg
 
     # Generate base name
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -89,9 +91,15 @@ def upload_to_s3(s3_client, data, job, job_quantity):
     # Find non-conflicting filename
     sequence = 1
     file_name = base_file_name
-    while check_file_exists(s3_client, bucket_name, file_name):
-        file_name = f"logs/{current_date}-{job}-{job_quantity}-{sequence}.txt"
-        sequence += 1
+
+    try:
+        while check_file_exists(s3_client, bucket_name, file_name):
+            file_name = f"logs/{current_date}-{job}-{job_quantity}-{sequence}.txt"
+            sequence += 1
+    except Exception as e:
+        error_msg = f"Error checking file existence: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        return False, None, error_msg
 
     try:
         # Upload the data
@@ -99,67 +107,116 @@ def upload_to_s3(s3_client, data, job, job_quantity):
 
         # Verify the upload by checking the object again
         if not check_file_exists(s3_client, bucket_name, file_name):
-            print("Upload failed verification — file does not exist in S3.")
-            return False, None
+            error_msg = (
+                "Upload failed verification — file does not exist in S3 after upload."
+            )
+            print(error_msg)
+            return False, None, error_msg
 
         print(f"Verified upload OK → {file_name}")
-        return True, file_name
+        return True, file_name, None
+
+    except NoCredentialsError:
+        error_msg = "AWS credentials not found. Please check your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY."
+        print(f"[ERROR] {error_msg}")
+        return False, None, error_msg
+
+    except PartialCredentialsError:
+        error_msg = "Incomplete AWS credentials. Please ensure both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set."
+        print(f"[ERROR] {error_msg}")
+        return False, None, error_msg
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        error_message = e.response["Error"]["Message"]
+
+        if error_code == "NoSuchBucket":
+            error_msg = f"S3 bucket '{bucket_name}' does not exist."
+        elif error_code == "AccessDenied" or error_code == "403":
+            error_msg = (
+                f"Access denied (403 Forbidden) to S3 bucket '{bucket_name}'.\n\n"
+                f"Required IAM permissions:\n"
+                f"  • s3:PutObject (to upload files)\n"
+                f"  • s3:GetObject (to verify uploads)\n"
+                f"  • s3:ListBucket (to check existing files)\n\n"
+                f"Please contact your AWS administrator to grant these permissions."
+            )
+        elif error_code == "InvalidAccessKeyId":
+            error_msg = "Invalid AWS Access Key ID."
+        elif error_code == "SignatureDoesNotMatch":
+            error_msg = "AWS Secret Access Key is incorrect."
+        else:
+            error_msg = f"AWS ClientError ({error_code}): {error_message}"
+
+        print(f"[ERROR] {error_msg}")
+        return False, None, error_msg
+
+    except BotoCoreError as e:
+        error_msg = f"BotoCore Error: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        return False, None, error_msg
 
     except Exception as e:
-        print(f"[ERROR] Upload failed: {e}")
-        return False, None
+        error_msg = f"Unexpected error during S3 upload: {type(e).__name__} - {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        return False, None, error_msg
+
 
 def check_file_exists(s3_client, bucket_name, file_name):
     """
     Check if a file exists in the S3 bucket.
-
-    :param s3_client: The boto3 S3 client.
-    :param bucket_name: The name of the S3 bucket.
-    :param file_name: The name of the file to check.
-    :return: True if the file exists, False otherwise.
     """
     try:
         s3_client.head_object(Bucket=bucket_name, Key=file_name)
-        return True  # File exists
-    except s3_client.exceptions.ClientError:
-        return False  # File does not exist
+        return True
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code == "404":
+            return False
+        elif error_code == "403":
+            # Forbidden - lack of permissions, treat as file doesn't exist
+            # but this indicates a permission issue
+            print(
+                f"[WARNING] 403 Forbidden when checking {file_name}. Permission issue detected."
+            )
+            return False
+        else:
+            # Re-raise for other errors
+            raise
 
-# Function to display a custom message box
+
 def show_custom_message(title, message, icon_path=None):
-    """ Function to display a custom message box """
+    """Function to display a custom message box"""
     custom_message_box = tk.Toplevel()
     custom_message_box.title(title)
+    custom_message_box.geometry("400x300")
 
-    # Set the window size
-    custom_message_box.geometry("300x230")
-
-    # If an icon is provided, add it to the message box
     if icon_path:
         try:
             img = Image.open(icon_path)
             img = img.resize((30, 30), Image.Resampling.LANCZOS)
             icon = ImageTk.PhotoImage(img)
             icon_label = tk.Label(custom_message_box, image=icon)
-            icon_label.image = icon  # Keep a reference to avoid garbage collection
-            icon_label.pack(side="top", pady=(10, 5))  # Add some padding to the icon
+            icon_label.image = icon
+            icon_label.pack(side="top", pady=(10, 5))
         except Exception as e:
             print(f"Error loading icon: {e}")
 
-    # Add a label for the message
-    message_label = tk.Label(custom_message_box, text=message, wraplength=250, padx=10, pady=10)
+    message_label = tk.Label(
+        custom_message_box, text=message, wraplength=350, padx=10, pady=10
+    )
     message_label.pack()
 
-    # Add an OK button to close the message box
-    ok_button = tk.Button(custom_message_box, text="OK", command=custom_message_box.destroy)
+    ok_button = tk.Button(
+        custom_message_box, text="OK", command=custom_message_box.destroy
+    )
     ok_button.pack(pady=10)
 
-def delete_log_file(file_path):
-    # Convert to raw string format for Windows path handling
-    file_path = os.path.normpath(file_path)  # Normalize path to avoid issues with backslashes
 
-    # Ensure the path points to a file, not a directory
+def delete_log_file(file_path):
+    file_path = os.path.normpath(file_path)
+
     if os.path.isfile(file_path):
-        # Make file writable if necessary
         os.chmod(file_path, stat.S_IWRITE)
         try:
             os.remove(file_path)
@@ -171,8 +228,8 @@ def delete_log_file(file_path):
     else:
         print(f"The specified path does not point to a valid file: {file_path}")
 
+
 class LogAnalyzerApp:
-    """ Main Tkinter application class for log analysis and database posting """
     CONFIG_FILE = "config.ini"
 
     def __init__(self, root):
@@ -180,105 +237,119 @@ class LogAnalyzerApp:
         self.root.title("Log Analyzer")
         self.file_path = None
 
-        # Load configurations
         self.config = configparser.ConfigParser()
         self.load_config()
 
-        # GUI Elements
         self.setup_gui()
 
-        # Automatically select log file if path is found in configuration
         if self.last_file_path:
             self.file_path = self.last_file_path
             threading.Thread(target=self.load_log_file, daemon=True).start()
         else:
-            self.select_log_file()  # Prompt user to select a log file
+            self.select_log_file()
 
     def setup_gui(self):
-        tk.Label(self.root, text="Device Name:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self.root, text="Device Name:").grid(
+            row=0, column=0, padx=5, pady=5, sticky="e"
+        )
         self.device_name_entry = tk.Entry(self.root)
         self.device_name_entry.grid(row=0, column=1, padx=5, pady=5)
-        self.device_name_entry.insert(0, self.device_name) 
+        self.device_name_entry.insert(0, self.device_name)
 
-        tk.Label(self.root, text="Job Month:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self.root, text="Job Month:").grid(
+            row=1, column=0, padx=5, pady=5, sticky="e"
+        )
         self.month_var = tk.StringVar(value="JAN")
-        month_options = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+        month_options = [
+            "JAN",
+            "FEB",
+            "MAR",
+            "APR",
+            "MAY",
+            "JUN",
+            "JUL",
+            "AUG",
+            "SEP",
+            "OCT",
+            "NOV",
+            "DEC",
+        ]
         self.month_menu = tk.OptionMenu(self.root, self.month_var, *month_options)
         self.month_menu.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
-        tk.Label(self.root, text="Job Number:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self.root, text="Job Number:").grid(
+            row=2, column=0, padx=5, pady=5, sticky="e"
+        )
         self.job_number_entry = tk.Entry(self.root)
         self.job_number_entry.grid(row=2, column=1, padx=5, pady=5)
 
-        tk.Label(self.root, text="Job Quantity:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(self.root, text="Job Quantity:").grid(
+            row=3, column=0, padx=5, pady=5, sticky="e"
+        )
         self.quantity_entry = tk.Entry(self.root)
         self.quantity_entry.grid(row=3, column=1, padx=5, pady=5)
 
-        self.select_file_button = tk.Button(self.root, text="Select Log File", command=self.select_log_file)
+        self.select_file_button = tk.Button(
+            self.root, text="Select Log File", command=self.select_log_file
+        )
         self.select_file_button.grid(row=4, column=0, columnspan=2, padx=5, pady=5)
 
-        self.analyze_button = tk.Button(self.root, text="Analyze and Post to Database", command=self.analyze_and_post)
+        self.analyze_button = tk.Button(
+            self.root,
+            text="Analyze and Post to Database",
+            command=self.analyze_and_post,
+        )
         self.analyze_button.grid(row=5, column=0, columnspan=2, padx=5, pady=10)
 
     def load_config(self):
-        """ Load device name and last file path from configuration file """
         if os.path.exists(self.CONFIG_FILE):
             self.config.read(self.CONFIG_FILE)
             self.device_name = self.config.get("Settings", "device_name", fallback="")
-            self.last_file_path = self.config.get("Settings", "last_file_path", fallback="")
+            self.last_file_path = self.config.get(
+                "Settings", "last_file_path", fallback=""
+            )
         else:
             self.device_name = ""
             self.last_file_path = ""
 
     def save_config(self):
-        """ Save device name and last file path to configuration file """
         self.config["Settings"] = {
             "device_name": self.device_name_entry.get(),
-            "last_file_path": self.file_path if self.file_path else ""
+            "last_file_path": self.file_path if self.file_path else "",
         }
         with open(self.CONFIG_FILE, "w") as configfile:
             self.config.write(configfile)
 
     def select_log_file(self):
-        """
-        Opens a file dialog for the user to select a log file.
-        
-        Allows the user to browse and select a log file
-        with a .txt extension. If a file is selected, it displays a
-        message confirming the selection and saves the file path in
-        the 
-        """
         self.file_path = filedialog.askopenfilename(filetypes=[("Log files", "*.txt")])
         if self.file_path:
-            messagebox.showinfo("File Selected", f"Selected log file: {os.path.basename(self.file_path)}")
-            self.save_config()  # Save the selected file path in config
+            messagebox.showinfo(
+                "File Selected",
+                f"Selected log file: {os.path.basename(self.file_path)}",
+            )
+            self.save_config()
 
     def load_log_file(self):
-        """ This function is executed in a separate thread """
         try:
-            # Simulate a delay for loading the log file (e.g., reading from disk)
             if os.path.isfile(self.file_path):
-                messagebox.showinfo("Log File Loaded", f"Loaded log file from configuration: {os.path.basename(self.file_path)}")
+                messagebox.showinfo(
+                    "Log File Loaded",
+                    f"Loaded log file from configuration: {os.path.basename(self.file_path)}",
+                )
             else:
-                messagebox.showwarning("File Not Found", "The log file path is invalid.")
+                messagebox.showwarning(
+                    "File Not Found", "The log file path is invalid."
+                )
         except Exception as e:
-            messagebox.showerror("Error", f"An error occurred while loading the log file:\n{e}")
+            messagebox.showerror(
+                "Error", f"An error occurred while loading the log file:\n{e}"
+            )
 
     def read_and_analyze_log(self):
-        """
-        Reads and analyzes the selected log file for specific keywords.
-        
-        Reads the content of the selected log file and counts
-        the occurrences of the keywords "programmed" and "passed verification".
-        If no file has been selected, it prompts the user to select a file.
-        
-        Returns:
-            tuple: A tuple containing two integers:
-                   - programmed_count: The number of times "programmed" appears in the log file.
-                   - verified_count: The number of times "passed verification" appears in the log file.
-        """
         if not self.file_path:
-            messagebox.showwarning("No File Selected", "Please select a log file first.")
+            messagebox.showwarning(
+                "No File Selected", "Please select a log file first."
+            )
             return None, None
 
         with open(self.file_path, "r") as log_file:
@@ -295,72 +366,65 @@ class LogAnalyzerApp:
             "job_quantity": job_quantity,
             "programmed": programmed,
             "verified": verified,
-            "device": self.device_name_entry.get()  # Use the entered device name
+            "device": self.device_name_entry.get(),
         }
-        
-        # Assuming `supabase` is already configured and connected
+
         try:
-            # Insert the data into the Supabase table
             response = supabase.table("ij_coding_log_ver1").insert(data).execute()
 
-            # Check if the response data matches what was inserted
             if response.data and len(response.data) > 0:
                 inserted_record = response.data[0]
-                # Ensure the inserted record contains the same data as the original data
                 if all(inserted_record[key] == data[key] for key in data):
-                    return True
+                    # Return the inserted record ID for potential rollback
+                    return True, inserted_record.get("id")
                 else:
                     print("Inserted data does not match:", inserted_record)
-                    return False
+                    return False, None
             else:
                 print("Failed to post data:", response.error)
-                return False
+                return False, None
         except Exception as exception:
             print("An error occurred:", exception)
+            return False, None
+
+    def rollback_database(self, record_id):
+        """
+        Rollback the database entry by deleting the record with the given ID.
+        """
+        try:
+            response = (
+                supabase.table("ij_coding_log_ver1")
+                .delete()
+                .eq("id", record_id)
+                .execute()
+            )
+            if response.data:
+                print(f"Successfully rolled back database entry with ID: {record_id}")
+                return True
+            else:
+                print(f"Failed to rollback database entry: {response.error}")
+                return False
+        except Exception as e:
+            print(f"Error during rollback: {e}")
             return False
-        
+
     def analyze_and_post(self):
-        """
-        Posts data to the Supabase database for tracking job and verification details.
-
-        This method constructs a dictionary containing information about a job (job ID, quantity,
-        programmed count, verified count, and device name) and inserts it into the "ij_coding_log_ver1"
-        table in the Supabase database. It verifies that the inserted data matches the intended data
-        before confirming a successful post.
-
-        Args:
-            job (str): The job order identifier.
-            job_quantity (int): The quantity of items for the job.
-            programmed (int): The count of items programmed.
-            verified (int): The count of items verified as passed.
-
-        Returns:
-            bool: True if the data was successfully posted and verified in the database,
-                False otherwise (including cases of data mismatch, insertion failure, or exceptions).
-        
-        Raises:
-            Exception: Any exceptions that occur during the database insertion are caught and logged,
-                    resulting in a False return value.
-
-        Notes:
-            - This method assumes `supabase` is already configured and connected.
-            - It accesses `self.device_name_entry.get()` to retrieve the device name.
-        """
-        # Save the device name to the config when analyze is triggered
         self.save_config()
 
-        # Combine job month and job number
         job_month = self.month_var.get()
         job_number = self.job_number_entry.get().strip()
         if not job_number.isdigit():
-            messagebox.showwarning("Invalid Input", "Please enter a valid numeric job number.")
+            messagebox.showwarning(
+                "Invalid Input", "Please enter a valid numeric job number."
+            )
             return
         job = f"{job_month} {job_number}"
 
-        # Validate job quantity
         job_quantity = self.quantity_entry.get().strip()
         if not job_quantity.isdigit():
-            messagebox.showwarning("Invalid Input", "Please enter a valid job quantity.")
+            messagebox.showwarning(
+                "Invalid Input", "Please enter a valid job quantity."
+            )
             return
         job_quantity = int(job_quantity)
 
@@ -369,52 +433,105 @@ class LogAnalyzerApp:
         if programmed is None or verified is None:
             return
 
-        # Display results
-        result_message = (f"Job: {job}\n"
-                          f"Job Quantity: {job_quantity}\n"
-                          f"Programmed: {programmed}\n"
-                          f"Verified: {verified}\n")
+        result_message = (
+            f"Job: {job}\n"
+            f"Job Quantity: {job_quantity}\n"
+            f"Programmed: {programmed}\n"
+            f"Verified: {verified}\n"
+        )
 
-        post_success = False
         if programmed >= job_quantity:
             if verified >= job_quantity:
-                # Alert if programmed or verified exceeds job_quantity by more than 10
                 if programmed > job_quantity + 10 or verified > job_quantity + 10:
                     messagebox.showinfo(
-                        "Alert", 
-                        "The difference between the counts and job quantity is more than 10. Please review."
+                        "Alert",
+                        "The difference between the counts and job quantity is more than 10. Please review.",
                     )
-                
-                result_message += "\nCondition met. Attempting to post data to the database."
-                post_success = self.post_to_database(job, job_quantity, programmed, verified)
+
+                result_message += (
+                    "\nCondition met. Attempting to post data to the database."
+                )
+                post_success, record_id = self.post_to_database(
+                    job, job_quantity, programmed, verified
+                )
+
                 if post_success:
                     result_message += "\nData successfully posted to the database."
-                    show_custom_message("Success", result_message, "accept.png")
-                    # Delete log file after successful post
+
+                    # Try to upload to S3
                     try:
-                        with open(self.file_path, 'rb') as file:
+                        with open(self.file_path, "rb") as file:
                             file_content = file.read()
-                        success, s3_file_name = upload_to_s3(s3, file_content, job, job_quantity)
+
+                        success, s3_file_name, error_msg = upload_to_s3(
+                            s3, file_content, job, job_quantity
+                        )
 
                         if success:
-                            messagebox.showinfo("Log File Uploaded", f"Data uploaded to S3 successfully:\n{s3_file_name}")
+                            result_message += (
+                                f"\nData uploaded to S3 successfully: {s3_file_name}"
+                            )
+                            show_custom_message("Success", result_message, "accept.png")
+
+                            # Delete log file after successful upload
                             delete_log_file(self.file_path)
-                            messagebox.showinfo("Log File Deleted", "The log file has been deleted successfully.")
+                            messagebox.showinfo(
+                                "Log File Deleted",
+                                "The log file has been deleted successfully.",
+                            )
                         else:
-                            messagebox.showerror("Upload Failed", "Failed to upload data to S3. Log file was NOT deleted.")
+                            # S3 upload failed - rollback database entry
+                            error_detail = f"\n\nS3 Upload Error Details:\n{error_msg}"
+
+                            rollback_success = self.rollback_database(record_id)
+                            if rollback_success:
+                                result_message = (
+                                    f"S3 upload failed. Database entry has been rolled back.\n\n"
+                                    f"Job: {job}\n"
+                                    f"The log file was NOT deleted and database entry was NOT saved."
+                                    f"{error_detail}"
+                                )
+                            else:
+                                result_message = (
+                                    f"CRITICAL: S3 upload failed AND rollback failed!\n\n"
+                                    f"Database entry (ID: {record_id}) may need manual deletion.\n"
+                                    f"{error_detail}"
+                                )
+
+                            show_custom_message(
+                                "Upload Failed - Rolled Back",
+                                result_message,
+                                "close.png",
+                            )
 
                     except FileNotFoundError:
-                        print(f"File not found: {self.file_path}")
+                        error_msg = f"File not found: {self.file_path}"
+                        print(error_msg)
+                        rollback_success = self.rollback_database(record_id)
+                        messagebox.showerror(
+                            "File Error",
+                            f"{error_msg}\n\nDatabase entry rolled back: {rollback_success}",
+                        )
                     except Exception as e:
-                        print(f"Error deleting log file: {e}")
+                        error_msg = f"Unexpected error: {type(e).__name__} - {str(e)}"
+                        print(error_msg)
+                        rollback_success = self.rollback_database(record_id)
+                        messagebox.showerror(
+                            "Error",
+                            f"{error_msg}\n\nDatabase entry rolled back: {rollback_success}",
+                        )
                 else:
                     result_message += "\nFailed to post data to the database."
                     show_custom_message("Error", result_message, "close.png")
             else:
-                result_message += "\nCondition not met: Verified count is less than job quantity."
+                result_message += (
+                    "\nCondition not met: Verified count is less than job quantity."
+                )
                 show_custom_message("Condition Not Met", result_message, "close.png")
         else:
-            result_message += "\nCondition not met: Programmed count is less than job count."
+            result_message += (
+                "\nCondition not met: Programmed count is less than job count."
+            )
             show_custom_message("Condition Not Met", result_message, "close.png")
 
 
@@ -422,12 +539,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = LogAnalyzerApp(root)
     root.mainloop()
-
-
-
-
-
-
-
-
-    
