@@ -21,6 +21,12 @@ Key Features:
 - Custom message display using Tkinter pop-up windows.
 - Configuration management for storing device name, log file path and language.
 - Log file deletion after successful upload.
+- Two-station mode: when programming and verification run on separate PCs,
+  each PC is set to a station role ("program" or "verify"). Each station
+  uploads its half to Supabase Storage under {tenant}/pending/{job}/; the
+  station that submits second claims the job (atomic create of `claim.json`),
+  merges both halves, and publishes ONE metrics row exactly like a single PC
+  would. Either PC can finish first.
 
 Classes:
     MqttPublisher: Fire-and-forget publisher over paho-mqtt for EMQX.
@@ -88,6 +94,20 @@ def resolve_path(env_value, default_filename):
 JOB_NUMBER_LENGTH = 8
 
 DEFAULT_LANGUAGE = "en"
+
+# Station roles. "combined" = one PC has a log with both programming and
+# verification (original behaviour). "program" / "verify" = two-station line.
+ROLE_COMBINED = "combined"
+ROLE_PROGRAM = "program"
+ROLE_VERIFY = "verify"
+STATION_ROLES = (ROLE_COMBINED, ROLE_PROGRAM, ROLE_VERIFY)
+DEFAULT_ROLE = ROLE_COMBINED
+
+# Keyword each station counts in its own log.
+ROLE_KEYWORDS = {
+    ROLE_PROGRAM: "programmed",
+    ROLE_VERIFY: "passed verification",
+}
 
 # Shown in the language dropdown, in each language's own script.
 LANGUAGE_NAMES = {
@@ -167,6 +187,67 @@ TRANSLATIONS = {
         "success_title": "Success",
         "deleted_title": "Log File Deleted",
         "deleted_msg": "The log file has been deleted successfully.",
+        # --- Two-station mode ---------------------------------------------
+        "station_role": "Station",
+        "role_combined": "Single PC (program + verify)",
+        "role_program": "Program station",
+        "role_verify": "Verify station",
+        "role_name_program": "program",
+        "role_name_verify": "verify",
+        "res_station": "Station: {role}",
+        "res_own_count": "Count: {n}",
+        "cond_own_low": "Condition not met: {role} count is less than job quantity.",
+        "cond_own_high": (
+            "Condition not met: {role} count is more than job quantity + 10. "
+            "Please review."
+        ),
+        "partner_unknown": "",
+        "partner_checking": "Checking other station…",
+        "partner_waiting": "Other station ({role}): not submitted yet",
+        "partner_ready": (
+            "Other station ({role}) submitted: qty {qty}, model {model}, "
+            "product {product}"
+        ),
+        "partner_check_failed": "Could not check other station: {error}",
+        "loading_part": "Uploading this station's log…",
+        "loading_merge": "Merging both stations…",
+        "part_failed_msg": (
+            "Upload of this station's log failed. Nothing was published — "
+            "safe to retry.\nThe log file was NOT deleted.\n\n"
+            "Error details:\n{error}"
+        ),
+        "part_uploaded": "This station's log uploaded ({role}).",
+        "waiting_title": "Submitted — Waiting",
+        "waiting_msg": (
+            "Waiting for the {role} station. When it submits job {job}, "
+            "the results will be merged and published automatically."
+        ),
+        "claimed_title": "Submitted",
+        "claimed_msg": (
+            "The other station is merging and publishing job {job} right now. "
+            "Nothing more to do here."
+        ),
+        "merge_failed_title": "Merge Failed",
+        "merge_failed_msg": (
+            "Both stations have submitted, but the merge failed. Nothing was "
+            "published. Both logs are still in storage — resubmit from either "
+            "station to retry.\n\nError details:\n{error}"
+        ),
+        "mismatch_title": "Job Details Mismatch",
+        "mismatch_msg": (
+            "The two stations entered different details for job {job}. "
+            "Nothing was published.\n\n{fields}\n\n"
+            "Fix the details on the station that is wrong and press the "
+            "button again. If its local log was already deleted, the copy "
+            "in storage is reused automatically."
+        ),
+        "reused_part": "Local log not found — reusing this station's copy in storage.",
+        "mismatch_field": "{field}: this station \"{mine}\" vs other station \"{theirs}\"",
+        "merged_ok": "Merged with the {role} station's log.",
+        "split_publish_failed_msg": (
+            "Failed to publish data to MQTT. Both logs are still in storage — "
+            "resubmit from either station to retry."
+        ),
     },
     "ja": {
         "app_title": "ログアナライザー",
@@ -229,6 +310,63 @@ TRANSLATIONS = {
         "success_title": "成功",
         "deleted_title": "ログファイル削除",
         "deleted_msg": "ログファイルを削除しました。",
+        # --- 2台構成モード -------------------------------------------------
+        "station_role": "ステーション",
+        "role_combined": "1台構成 (書き込み+検証)",
+        "role_program": "書き込みステーション",
+        "role_verify": "検証ステーション",
+        "role_name_program": "書き込み",
+        "role_name_verify": "検証",
+        "res_station": "ステーション: {role}",
+        "res_own_count": "カウント: {n}",
+        "cond_own_low": "条件未達: {role}数がジョブ数量より少ないです。",
+        "cond_own_high": "条件未達: {role}数がジョブ数量+10を超えています。確認してください。",
+        "partner_unknown": "",
+        "partner_checking": "相手ステーションを確認中…",
+        "partner_waiting": "相手ステーション({role}): 未送信",
+        "partner_ready": (
+            "相手ステーション({role})送信済み: 数量 {qty}、モデル {model}、"
+            "商品 {product}"
+        ),
+        "partner_check_failed": "相手ステーションを確認できません: {error}",
+        "loading_part": "このステーションのログをアップロード中…",
+        "loading_merge": "両ステーションの結果を統合中…",
+        "part_failed_msg": (
+            "このステーションのログのアップロードに失敗しました。データは送信されていません。"
+            "再試行できます。\nログファイルは削除されていません。\n\n"
+            "エラー詳細:\n{error}"
+        ),
+        "part_uploaded": "このステーションのログをアップロードしました({role})。",
+        "waiting_title": "送信済み — 待機中",
+        "waiting_msg": (
+            "{role}ステーションを待っています。ジョブ {job} が送信されると、"
+            "自動的に統合・送信されます。"
+        ),
+        "claimed_title": "送信済み",
+        "claimed_msg": (
+            "相手ステーションがジョブ {job} を統合・送信中です。"
+            "こちらでの操作は不要です。"
+        ),
+        "merge_failed_title": "統合失敗",
+        "merge_failed_msg": (
+            "両ステーションの送信は完了していますが、統合に失敗しました。"
+            "データは送信されていません。両方のログはストレージに残っているため、"
+            "どちらかのステーションから再送信してください。\n\nエラー詳細:\n{error}"
+        ),
+        "mismatch_title": "ジョブ詳細の不一致",
+        "mismatch_msg": (
+            "2台のステーションでジョブ {job} の入力内容が異なります。"
+            "データは送信されていません。\n\n{fields}\n\n"
+            "間違っている方のステーションで修正して再度ボタンを押してください。"
+            "ローカルのログが削除済みの場合は、ストレージのコピーが自動的に使われます。"
+        ),
+        "reused_part": "ローカルログが見つからないため、ストレージのコピーを使用します。",
+        "mismatch_field": "{field}: こちら「{mine}」/ 相手「{theirs}」",
+        "merged_ok": "{role}ステーションのログと統合しました。",
+        "split_publish_failed_msg": (
+            "MQTTへのデータ送信に失敗しました。両方のログはストレージに残っているため、"
+            "どちらかのステーションから再送信してください。"
+        ),
     },
 }
 
@@ -297,6 +435,16 @@ APP_VERSION = os.environ.get("APP_VERSION", "1.0.0")
 # posting is a one-off event, not an aggregate or a rolling output window.
 METRICS_KIND = "event"
 METRICS_RESOLUTION = "event"
+
+# --- Two-station mode ---------------------------------------------------------
+# device_id written on the merged metrics row. Set the same value on both PCs
+# of a two-station line; if unset, the program station's DEVICE_ID is used so
+# the row is the same no matter which PC does the merge.
+LINE_DEVICE_ID = os.environ.get("LINE_DEVICE_ID")
+
+# A claim.json older than this (and not marked published) is treated as left
+# behind by a crashed merge and may be taken over.
+PENDING_CLAIM_STALE_SEC = float(os.environ.get("PENDING_CLAIM_STALE_SEC", "300"))
 
 _APP_START_MONOTONIC = time.monotonic()
 
@@ -397,18 +545,18 @@ class MqttPublisher:
 mqtt_client = MqttPublisher()
 
 
-def build_lot_envelope():
+def build_lot_envelope(machine_id=None):
     """Lot-creation request in the shape gokafka-raw's consumer expects."""
     return {
         "tenant_id": TENANT_ID,
-        "machine_id": MACHINE_ID,
+        "machine_id": machine_id or MACHINE_ID,
         "kind": "lot",
     }
 
 
-def publish_lot_record():
+def publish_lot_record(machine_id=None):
     """Fire-and-forget MQTT publish of a lot-creation event."""
-    return mqtt_client.publish(build_lot_envelope())
+    return mqtt_client.publish(build_lot_envelope(machine_id))
 
 
 def check_file_exists_in_storage(bucket_name, file_name):
@@ -478,6 +626,184 @@ def upload_to_storage(data, job, job_quantity):
         return False, None, error_msg
 
 
+# ---------------------------------------------------------------------------
+# Two-station mode: pending halves in Supabase Storage
+# ---------------------------------------------------------------------------
+# Layout, per job:
+#   {tenant}/pending/{job}/program.txt   raw log from the program station
+#   {tenant}/pending/{job}/program.json  that station's job details + count
+#   {tenant}/pending/{job}/verify.txt
+#   {tenant}/pending/{job}/verify.json
+#   {tenant}/pending/{job}/claim.json   created (no upsert) by the merger
+#
+# The .json is written after the .txt, so a .json existing means that half is
+# complete. Creating claim.json without upsert is atomic on the Storage side: the
+# second creator gets a 409 Duplicate, so only one PC ever publishes.
+
+
+class ClaimHeld(Exception):
+    """Another station holds a live claim on this job."""
+
+
+def other_role(role):
+    return ROLE_VERIFY if role == ROLE_PROGRAM else ROLE_PROGRAM
+
+
+def pending_dir(job):
+    return f"{TENANT_ID}/pending/{job}"
+
+
+def _bucket():
+    return supabase.storage.from_(SUPABASE_STORAGE_BUCKET)
+
+
+def _is_duplicate_error(exc):
+    text = str(exc).lower()
+    return "409" in text or "duplicate" in text or "already exists" in text
+
+
+def count_keyword(data, role):
+    """Count the station's keyword in a raw log (bytes or str)."""
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", errors="replace")
+    return data.lower().count(ROLE_KEYWORDS[role])
+
+
+def pending_part_exists(job, role, ext="json"):
+    return check_file_exists_in_storage(
+        SUPABASE_STORAGE_BUCKET, f"{pending_dir(job)}/{role}.{ext}"
+    )
+
+
+def download_pending_log(job, role):
+    return _bucket().download(f"{pending_dir(job)}/{role}.txt")
+
+
+def read_pending_meta(job, role):
+    """Return the station's meta dict, or None if that half isn't submitted."""
+    if not pending_part_exists(job, role, "json"):
+        return None
+    raw = _bucket().download(f"{pending_dir(job)}/{role}.json")
+    return json.loads(raw.decode("utf-8"))
+
+
+def upload_pending_part(job, role, log_bytes, meta):
+    """
+    Upload (or overwrite) this station's half. Pass log_bytes=None to keep the
+    log already in storage and only rewrite the details (.json).
+    """
+    base = pending_dir(job)
+    if log_bytes is not None:
+        _bucket().upload(
+            path=f"{base}/{role}.txt",
+            file=log_bytes,
+            file_options={"content-type": "text/plain", "upsert": "true"},
+        )
+    _bucket().upload(
+        path=f"{base}/{role}.json",
+        file=json.dumps(meta, ensure_ascii=False).encode("utf-8"),
+        file_options={"content-type": "application/json", "upsert": "true"},
+    )
+    if not pending_part_exists(job, role, "json"):
+        raise RuntimeError("Upload failed verification — part not found after upload.")
+
+
+def _write_claim(job, state, upsert):
+    payload = {
+        "by": DEVICE_ID,
+        "state": state,
+        "at": _iso_ms_z(datetime.now(timezone.utc)),
+        "epoch": time.time(),
+    }
+    _bucket().upload(
+        path=f"{pending_dir(job)}/claim.json",
+        file=json.dumps(payload).encode("utf-8"),
+        file_options={
+            "content-type": "application/json",
+            "upsert": "true" if upsert else "false",
+        },
+    )
+
+
+def try_claim(job):
+    """
+    Atomically claim the merge for `job`. Returns True if this PC won.
+    Raises ClaimHeld if another PC holds a live (or already published) claim.
+    A stale, unpublished claim (crashed merge) is taken over.
+    """
+    try:
+        _write_claim(job, "merging", upsert=False)
+        return True
+    except Exception as e:
+        if not _is_duplicate_error(e):
+            raise
+
+    # Someone holds it — is it stale?
+    try:
+        existing = json.loads(_bucket().download(f"{pending_dir(job)}/claim.json"))
+    except Exception:
+        raise ClaimHeld()
+
+    age = time.time() - float(existing.get("epoch", 0))
+    if existing.get("state") == "published" or age < PENDING_CLAIM_STALE_SEC:
+        raise ClaimHeld()
+
+    print(f"[PENDING] Taking over stale claim on {job} (age {int(age)}s)")
+    release_claim(job)
+    try:
+        _write_claim(job, "merging", upsert=False)
+        return True
+    except Exception as e:
+        if _is_duplicate_error(e):
+            raise ClaimHeld()
+        raise
+
+
+def release_claim(job):
+    try:
+        _bucket().remove([f"{pending_dir(job)}/claim.json"])
+    except Exception as e:
+        print(f"[PENDING] Failed to release claim on {job}: {e}")
+
+
+def finish_pending(job):
+    """
+    After a successful publish: mark the claim as published first (so a
+    leftover folder can never be merged twice), then remove the halves, then
+    the claim itself.
+    """
+    base = pending_dir(job)
+    try:
+        _write_claim(job, "published", upsert=True)
+    except Exception as e:
+        print(f"[PENDING] Failed to mark {job} published: {e}")
+    try:
+        _bucket().remove(
+            [f"{base}/{r}.{ext}" for r in (ROLE_PROGRAM, ROLE_VERIFY) for ext in ("txt", "json")]
+        )
+        _bucket().remove([f"{base}/claim.json"])
+    except Exception as e:
+        print(f"[PENDING] Cleanup of {base} failed (claim kept as published): {e}")
+
+
+def build_merged_log(program_meta, program_log, verify_meta, verify_log):
+    """One file for logs/ so downstream still sees a single storage_path."""
+
+    def header(role, meta):
+        return (
+            f"===== {role.upper()} STATION | device_id={meta.get('device_id')} "
+            f"| device={meta.get('device_name')} | submitted={meta.get('submitted_at')} =====\n"
+        ).encode("utf-8")
+
+    return (
+        header(ROLE_PROGRAM, program_meta)
+        + program_log
+        + b"\n\n"
+        + header(ROLE_VERIFY, verify_meta)
+        + verify_log
+    )
+
+
 def show_custom_message(title, message, icon_path=None, ok_text="OK", font=None):
     """Function to display a custom message box"""
     custom_message_box = tk.Toplevel()
@@ -536,8 +862,8 @@ class LogAnalyzerApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.geometry("620x600")
-        self.root.minsize(560, 560)
+        self.root.geometry("620x640")
+        self.root.minsize(560, 600)
         self.file_path = None
 
         # (widget, font_size, bold) — re-fonted when the language changes,
@@ -583,6 +909,97 @@ class LogAnalyzerApp:
         self.save_config()
         self._apply_language()
 
+    # ------------------------------------------------------------------
+    # Station role
+    # ------------------------------------------------------------------
+    @property
+    def is_split(self):
+        return self.station_role in (ROLE_PROGRAM, ROLE_VERIFY)
+
+    def role_label(self, role):
+        """Short in-sentence name for a role ('program' / '書き込み')."""
+        return self.t(f"role_name_{role}")
+
+    def _role_display_names(self):
+        return [self.t(f"role_{r}") for r in STATION_ROLES]
+
+    def _on_role_selected(self, _event=None):
+        idx = self.role_menu.current()
+        if 0 <= idx < len(STATION_ROLES):
+            self.station_role = STATION_ROLES[idx]
+        self.save_config()
+        self._partner_state = None
+        self._render_partner_status()
+        self._check_partner()
+
+    def _on_job_number_changed(self, *_):
+        self._partner_state = None
+        self._render_partner_status()
+        if len(self.job_number_var.get()) == JOB_NUMBER_LENGTH:
+            self._check_partner()
+
+    def _check_partner(self):
+        """Look up the other station's half for the typed job (background)."""
+        job = self.job_number_var.get().strip()
+        if not self.is_split or len(job) != JOB_NUMBER_LENGTH:
+            return
+        role = other_role(self.station_role)
+        self._partner_state = ("checking",)
+        self._render_partner_status()
+
+        def worker():
+            try:
+                meta = read_pending_meta(job, role)
+                state = ("ready", meta) if meta else ("waiting",)
+            except Exception as e:
+                state = ("failed", str(e))
+            self.root.after(0, lambda: self._apply_partner_result(job, state))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_partner_result(self, job, state):
+        if job != self.job_number_var.get().strip():
+            return  # job number changed while we were checking
+        self._partner_state = state
+        if state[0] == "ready":
+            # Prefill empty fields from the station that submitted first.
+            meta = state[1]
+            for entry, key in (
+                (self.quantity_entry, "job_quantity"),
+                (self.model_name_entry, "model_name"),
+                (self.product_code_entry, "product_code"),
+            ):
+                if not entry.get().strip() and meta.get(key) not in (None, ""):
+                    entry.insert(0, str(meta[key]))
+        self._render_partner_status()
+
+    def _render_partner_status(self):
+        if not self.is_split:
+            self.partner_label.grid_remove()
+            return
+        self.partner_label.grid()
+        role = self.role_label(other_role(self.station_role))
+        state = getattr(self, "_partner_state", None)
+        if state is None:
+            text, style = self.t("partner_unknown"), SECONDARY
+        elif state[0] == "checking":
+            text, style = self.t("partner_checking"), SECONDARY
+        elif state[0] == "waiting":
+            text, style = self.t("partner_waiting", role=role), WARNING
+        elif state[0] == "ready":
+            meta = state[1]
+            text = self.t(
+                "partner_ready",
+                role=role,
+                qty=meta.get("job_quantity", "?"),
+                model=meta.get("model_name") or "-",
+                product=meta.get("product_code") or "-",
+            )
+            style = SUCCESS
+        else:
+            text, style = self.t("partner_check_failed", error=state[1]), DANGER
+        self.partner_label.configure(text=text, bootstyle=style)
+
     def _apply_language(self):
         """Refresh every translatable label/font for the current language."""
         self.root.title(self.t("app_title"))
@@ -603,6 +1020,10 @@ class LogAnalyzerApp:
         self.quantity_label.configure(text=self.t("job_quantity"))
         self.model_name_label.configure(text=self.t("model_name"))
         self.product_code_label.configure(text=self.t("product_code"))
+        self.role_label_widget.configure(text=self.t("station_role"))
+        self.role_menu.configure(values=self._role_display_names())
+        self.role_menu.current(STATION_ROLES.index(self.station_role))
+        self._render_partner_status()
 
         self.file_card.configure(text=self.t("log_file"))
         if self.file_path and os.path.isfile(self.file_path):
@@ -664,22 +1085,39 @@ class LogAnalyzerApp:
         details.columnconfigure(0, weight=1)
         details.columnconfigure(1, weight=1)
 
-        # Device name (full width)
+        # Device name | Station role
         self.device_name_label = self._track_font(tb.Label(details), 10)
         self.device_name_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
         self.device_name_entry = self._track_font(tb.Entry(details), 10)
         self.device_name_entry.grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=(0, 12)
+            row=1, column=0, sticky="ew", pady=(0, 12), padx=(0, 8)
         )
         self.device_name_entry.insert(0, self.device_name)
+
+        self.role_label_widget = self._track_font(tb.Label(details), 10)
+        self.role_label_widget.grid(row=0, column=1, sticky="w", pady=(0, 4))
+        self.role_menu = self._track_font(
+            tb.Combobox(details, state="readonly", values=self._role_display_names()),
+            10,
+        )
+        self.role_menu.grid(row=1, column=1, sticky="ew", pady=(0, 12))
+        self.role_menu.bind("<<ComboboxSelected>>", self._on_role_selected)
 
         # Job number (8 digits) | Job quantity
         self.job_number_label = self._track_font(tb.Label(details), 10)
         self.job_number_label.grid(row=2, column=0, sticky="w", pady=(0, 4))
         job_vcmd = (self.root.register(self._validate_job_number), "%P")
+        self.job_number_var = tk.StringVar()
         self.job_number_entry = self._track_font(
-            tb.Entry(details, validate="key", validatecommand=job_vcmd), 10
+            tb.Entry(
+                details,
+                textvariable=self.job_number_var,
+                validate="key",
+                validatecommand=job_vcmd,
+            ),
+            10,
         )
+        self.job_number_var.trace_add("write", self._on_job_number_changed)
         self.job_number_entry.grid(
             row=3, column=0, sticky="ew", pady=(0, 12), padx=(0, 8)
         )
@@ -699,6 +1137,13 @@ class LogAnalyzerApp:
         self.product_code_label.grid(row=4, column=1, sticky="w", pady=(0, 4))
         self.product_code_entry = self._track_font(tb.Entry(details), 10)
         self.product_code_entry.grid(row=5, column=1, sticky="ew")
+
+        # Other station's status (two-station mode only)
+        self._partner_state = None
+        self.partner_label = self._track_font(
+            tb.Label(details, bootstyle=SECONDARY, wraplength=520), 9
+        )
+        self.partner_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         # --- Log file card ------------------------------------------------
         self.file_card = self._track_font(tb.Labelframe(container, padding=16), 10)
@@ -752,6 +1197,7 @@ class LogAnalyzerApp:
         self.device_name = ""
         self.last_file_path = ""
         self.language = DEFAULT_LANGUAGE
+        self.station_role = DEFAULT_ROLE
 
         if os.path.exists(self.CONFIG_FILE):
             self.config.read(self.CONFIG_FILE, encoding="utf-8")
@@ -762,15 +1208,21 @@ class LogAnalyzerApp:
             self.language = self.config.get(
                 "Settings", "language", fallback=DEFAULT_LANGUAGE
             )
+            self.station_role = self.config.get(
+                "Settings", "station_role", fallback=DEFAULT_ROLE
+            )
 
         if self.language not in TRANSLATIONS:
             self.language = DEFAULT_LANGUAGE
+        if self.station_role not in STATION_ROLES:
+            self.station_role = DEFAULT_ROLE
 
     def save_config(self):
         self.config["Settings"] = {
             "device_name": self.device_name_entry.get(),
             "last_file_path": self.file_path if self.file_path else "",
             "language": self.language,
+            "station_role": self.station_role,
         }
         with open(self.CONFIG_FILE, "w", encoding="utf-8") as configfile:
             self.config.write(configfile)
@@ -844,6 +1296,7 @@ class LogAnalyzerApp:
 
         # Don't allow switching language mid-request.
         self.language_menu.configure(state=DISABLED)
+        self.role_menu.configure(state=DISABLED)
 
     def _update_loading(self, message):
         if getattr(self, "loading_win", None) and self.loading_win.winfo_exists():
@@ -857,6 +1310,7 @@ class LogAnalyzerApp:
             win.destroy()
         self.loading_win = None
         self.language_menu.configure(state="readonly")
+        self.role_menu.configure(state="readonly")
 
     # ------------------------------------------------------------------
     # Analysis + publish
@@ -935,6 +1389,10 @@ class LogAnalyzerApp:
             self.quantity_entry.focus_set()
             return
         job_quantity = int(job_quantity)
+
+        if self.is_split:
+            self._start_split_submit(job, job_quantity)
+            return
 
         programmed, verified = self.read_and_analyze_log()
 
@@ -1061,10 +1519,285 @@ class LogAnalyzerApp:
             ),
         )
 
+    # ------------------------------------------------------------------
+    # Two-station mode
+    # ------------------------------------------------------------------
+    def _start_split_submit(self, job, job_quantity):
+        # Read every Tk value here on the main thread; the worker never
+        # touches widgets directly.
+        details = {
+            "job_quantity": job_quantity,
+            "model_name": self.model_name_entry.get().strip(),
+            "product_code": self.product_code_entry.get().strip(),
+            "device_name": self.device_name_entry.get().strip(),
+        }
+        self._show_loading(self.t("loading_part"))
+        self.analyze_button.configure(state=DISABLED)
+        threading.Thread(
+            target=self._split_worker,
+            args=(job, self.station_role, details, self.file_path),
+            daemon=True,
+        ).start()
+
+    def _finish_on_ui(self, title, message, icon, **kwargs):
+        self.root.after(
+            0, lambda: self._finish_publish(title, message, icon, **kwargs)
+        )
+
+    def _split_worker(self, job, role, details, file_path):
+        """
+        Background thread. Upload this station's half, then merge + publish if
+        the other station's half is already there.
+        """
+        role_name = self.role_label(role)
+        partner = other_role(role)
+        partner_name = self.role_label(partner)
+        qty = details["job_quantity"]
+        lines = [
+            self.t("res_job", job=job),
+            self.t("res_station", role=role_name),
+            self.t("res_qty", qty=qty),
+        ]
+
+        # 1. This station's log: the local file, or — if it was already
+        #    deleted after an earlier submit — the copy in storage.
+        reused = False
+        try:
+            if file_path and os.path.isfile(file_path):
+                with open(file_path, "rb") as f:
+                    log_bytes = f.read()
+            elif pending_part_exists(job, role, "txt"):
+                log_bytes = download_pending_log(job, role)
+                reused = True
+            else:
+                self._finish_on_ui(
+                    self.t("no_file_title"), self.t("no_file_msg"), None, is_error=True
+                )
+                return
+        except Exception as e:
+            self._finish_on_ui(
+                self.t("error_title"),
+                self.t("file_read_error", error=f"{type(e).__name__} - {e}"),
+                None,
+                is_error=True,
+            )
+            return
+
+        count = count_keyword(log_bytes, role)
+        lines.append(self.t("res_own_count", n=count))
+        if reused:
+            lines.append(self.t("reused_part"))
+
+        # Per-station check, same thresholds as the single-PC check.
+        failure_key = None
+        if count < qty:
+            failure_key = "cond_own_low"
+        elif count > qty + 10:
+            failure_key = "cond_own_high"
+        if failure_key:
+            msg = "\n".join(lines) + "\n\n" + self.t(failure_key, role=role_name)
+            self._finish_on_ui(self.t("cond_not_met_title"), msg, CLOSE_ICON)
+            return
+
+        # 2. Upload this station's half.
+        meta = {
+            **details,
+            "job": job,
+            "role": role,
+            "count": count,
+            "device_id": DEVICE_ID,
+            "machine_id": MACHINE_ID,
+            "app_version": APP_VERSION,
+            "submitted_at": _iso_ms_z(datetime.now(timezone.utc)),
+        }
+        try:
+            upload_pending_part(job, role, None if reused else log_bytes, meta)
+        except Exception as e:
+            self._finish_on_ui(
+                self.t("upload_failed_title"),
+                self.t("part_failed_msg", error=f"{type(e).__name__} - {e}"),
+                CLOSE_ICON,
+            )
+            return
+        lines.append(self.t("part_uploaded", role=role_name))
+
+        # The half is safely in storage now — the local log can go.
+        deleted = False
+        if not reused:
+            delete_log_file(file_path)
+            deleted = not os.path.exists(file_path)
+
+        # 3. Has the other station submitted?
+        try:
+            partner_meta = read_pending_meta(job, partner)
+        except Exception as e:
+            self._finish_on_ui(
+                self.t("merge_failed_title"),
+                "\n".join(lines) + "\n\n" + self.t("merge_failed_msg", error=e),
+                CLOSE_ICON,
+                deleted=deleted,
+            )
+            return
+
+        if partner_meta is None:
+            msg = "\n".join(lines) + "\n\n" + self.t(
+                "waiting_msg", role=partner_name, job=job
+            )
+            self._finish_on_ui(self.t("waiting_title"), msg, ACCEPT_ICON, deleted=deleted)
+            return
+
+        # 4. Both halves exist — claim the merge so only one PC publishes.
+        self.root.after(0, lambda: self._update_loading(self.t("loading_merge")))
+        try:
+            try_claim(job)
+        except ClaimHeld:
+            msg = "\n".join(lines) + "\n\n" + self.t("claimed_msg", job=job)
+            self._finish_on_ui(self.t("claimed_title"), msg, ACCEPT_ICON, deleted=deleted)
+            return
+        except Exception as e:
+            self._finish_on_ui(
+                self.t("merge_failed_title"),
+                "\n".join(lines) + "\n\n" + self.t("merge_failed_msg", error=e),
+                CLOSE_ICON,
+                deleted=deleted,
+            )
+            return
+
+        try:
+            title, msg, icon = self._merge_and_publish(
+                job, role, meta, log_bytes, partner, partner_meta, lines
+            )
+        except Exception as e:
+            release_claim(job)
+            title = self.t("merge_failed_title")
+            msg = "\n".join(lines) + "\n\n" + self.t(
+                "merge_failed_msg", error=f"{type(e).__name__} - {e}"
+            )
+            icon = CLOSE_ICON
+        self._finish_on_ui(title, msg, icon, deleted=deleted)
+
+    def _merge_and_publish(self, job, role, meta, log_bytes, partner, partner_meta, lines):
+        """
+        Runs while holding the claim. Releases it on every non-success path.
+        Returns (title, message, icon).
+        """
+        # Both stations must agree on the job details.
+        mismatches = []
+        for key, label_key in (
+            ("job_quantity", "job_quantity"),
+            ("model_name", "model_name"),
+            ("product_code", "product_code"),
+        ):
+            mine = str(meta.get(key, "")).strip()
+            theirs = str(partner_meta.get(key, "")).strip()
+            if mine.casefold() != theirs.casefold():
+                mismatches.append(
+                    self.t(
+                        "mismatch_field",
+                        field=self.t(label_key),
+                        mine=mine,
+                        theirs=theirs,
+                    )
+                )
+        if mismatches:
+            release_claim(job)
+            msg = "\n".join(lines) + "\n\n" + self.t(
+                "mismatch_msg", job=job, fields="\n".join(mismatches)
+            )
+            return self.t("mismatch_title"), msg, CLOSE_ICON
+
+        # Recount the partner's log rather than trusting its .json.
+        partner_log = download_pending_log(job, partner)
+        if role == ROLE_PROGRAM:
+            program_meta, program_log = meta, log_bytes
+            verify_meta, verify_log = partner_meta, partner_log
+        else:
+            program_meta, program_log = partner_meta, partner_log
+            verify_meta, verify_log = meta, log_bytes
+        programmed = count_keyword(program_log, ROLE_PROGRAM)
+        verified = count_keyword(verify_log, ROLE_VERIFY)
+        qty = int(meta["job_quantity"])
+
+        lines = lines + [
+            "",
+            self.t("res_programmed", n=programmed),
+            self.t("res_verified", n=verified),
+        ]
+
+        failure_key = None
+        if programmed < qty:
+            failure_key = "cond_programmed_low"
+        elif verified < qty:
+            failure_key = "cond_verified_low"
+        elif programmed > qty + 10 or verified > qty + 10:
+            failure_key = "cond_diff_high"
+        if failure_key:
+            release_claim(job)
+            msg = "\n".join(lines) + "\n\n" + self.t(failure_key)
+            return self.t("cond_not_met_title"), msg, CLOSE_ICON
+
+        # One merged file in logs/, so downstream still gets a single path.
+        merged = build_merged_log(program_meta, program_log, verify_meta, verify_log)
+        ok, storage_path, err = upload_to_storage(merged, job, qty)
+        if not ok:
+            release_claim(job)
+            msg = "\n".join(lines) + "\n\n" + self.t("merge_failed_msg", error=err)
+            return self.t("merge_failed_title"), msg, CLOSE_ICON
+        lines.append(self.t("upload_ok"))
+
+        def station(m):
+            return {"device_id": m.get("device_id"), "device_name": m.get("device_name")}
+
+        row = {
+            "tenant_id": TENANT_ID,
+            "device_id": LINE_DEVICE_ID or program_meta.get("device_id") or DEVICE_ID,
+            "resolution": METRICS_RESOLUTION,
+            "kind": METRICS_KIND,
+            "output": {
+                "programmed": programmed,
+                "verified": verified,
+                "job_quantity": qty,
+            },
+            "status": {
+                "job_order": job,
+                "device": program_meta.get("device_name", ""),
+                "model_name": program_meta.get("model_name", ""),
+                "product_code": program_meta.get("product_code", ""),
+                "storage_bucket": SUPABASE_STORAGE_BUCKET,
+                "storage_path": storage_path,
+                "mode": "two_station",
+                "stations": {
+                    ROLE_PROGRAM: station(program_meta),
+                    ROLE_VERIFY: station(verify_meta),
+                },
+            },
+        }
+
+        success, error = mqtt_client.publish(row)
+        if not success:
+            print("MQTT publish failed:", error)
+            release_claim(job)
+            msg = "\n".join(lines) + "\n\n" + self.t("split_publish_failed_msg")
+            return self.t("error_title"), msg, CLOSE_ICON
+
+        lines.append(self.t("published"))
+        lines.append(self.t("merged_ok", role=self.role_label(partner)))
+
+        lot_success, lot_error = publish_lot_record(program_meta.get("machine_id"))
+        if lot_success:
+            lines.append(self.t("lot_published"))
+        else:
+            lines.append(self.t("lot_failed", error=lot_error))
+
+        finish_pending(job)
+        return self.t("success_title"), "\n".join(lines), ACCEPT_ICON
+
     def _finish_publish(self, title, message, icon, deleted=False, is_error=False):
         """Main thread: close loading modal, re-enable button, show result."""
         self._hide_loading()
         self.analyze_button.configure(state=NORMAL)
+        if self.is_split:
+            self._check_partner()
 
         if is_error:
             messagebox.showerror(title, message)

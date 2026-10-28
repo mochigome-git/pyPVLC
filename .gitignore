@@ -8,3 +8,7 @@ Activity logs/
 # Ignore build and dist directories
 build/
 dist/
+
+# Python bytecode
+__pycache__/
+*.pyc
