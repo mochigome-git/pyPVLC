@@ -27,6 +27,13 @@ Key Features:
   station that submits second claims the job (atomic create of `claim.json`),
   merges both halves, and publishes ONE metrics row exactly like a single PC
   would. Either PC can finish first.
+- Supervisor modes (password protected, password "gcl", override with
+  SUPERVISOR_PASSWORD in .env):
+    * Force Pass — arms the NEXT submit to skip the "count is more than job
+      quantity + 10" limit. The published row is marked status.force_pass.
+      The "less than job quantity" check still applies.
+    * Reset Log — empties the selected activity log file so a new job starts
+      from a clean log (for when an operator mixed several jobs in one log).
 
 Classes:
     MqttPublisher: Fire-and-forget publisher over paho-mqtt for EMQX.
@@ -51,7 +58,7 @@ import configparser
 import threading
 import stat
 from datetime import datetime, timezone
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from dotenv import load_dotenv
 from PIL import Image, ImageTk
 import paho.mqtt.client as mqtt
@@ -248,6 +255,29 @@ TRANSLATIONS = {
             "Failed to publish data to MQTT. Both logs are still in storage — "
             "resubmit from either station to retry."
         ),
+        # --- Supervisor modes ---------------------------------------------
+        "password_title": "Supervisor Password",
+        "password_prompt": "Enter password to unlock {mode}:",
+        "password_wrong": "Wrong password.",
+        "force_btn": "Force Pass",
+        "force_btn_on": "Force Pass: ON (next submit)",
+        "force_mode": "Force Pass",
+        "force_armed_msg": (
+            "Force Pass is ON for the next submit.\n"
+            "The \"more than job quantity + 10\" limit will be skipped.\n"
+            "Press the button again to cancel."
+        ),
+        "force_cancelled": "Force Pass cancelled.",
+        "force_applied": "FORCE PASS: over-limit check skipped by supervisor.",
+        "reset_btn": "Reset Log",
+        "reset_mode": "Reset Log",
+        "reset_confirm": (
+            "This will ERASE everything in the activity log:\n{path}\n\n"
+            "Use this only when the log contains other jobs' activity. "
+            "Continue?"
+        ),
+        "reset_done": "The activity log has been cleared. You can start a new job.",
+        "reset_failed": "Could not clear the activity log:\n{error}",
     },
     "ja": {
         "app_title": "ログアナライザー",
@@ -367,6 +397,28 @@ TRANSLATIONS = {
             "MQTTへのデータ送信に失敗しました。両方のログはストレージに残っているため、"
             "どちらかのステーションから再送信してください。"
         ),
+        # --- 管理者モード -------------------------------------------------
+        "password_title": "管理者パスワード",
+        "password_prompt": "{mode}を解除するにはパスワードを入力してください:",
+        "password_wrong": "パスワードが違います。",
+        "force_btn": "強制合格",
+        "force_btn_on": "強制合格: ON (次回送信)",
+        "force_mode": "強制合格",
+        "force_armed_msg": (
+            "次回の送信で強制合格がONになります。\n"
+            "「ジョブ数量+10を超える」チェックをスキップします。\n"
+            "もう一度ボタンを押すとキャンセルします。"
+        ),
+        "force_cancelled": "強制合格をキャンセルしました。",
+        "force_applied": "強制合格: 管理者により上限チェックをスキップしました。",
+        "reset_btn": "ログリセット",
+        "reset_mode": "ログリセット",
+        "reset_confirm": (
+            "アクティビティログの内容をすべて消去します:\n{path}\n\n"
+            "他のジョブのログが混ざっている場合のみ使用してください。続行しますか?"
+        ),
+        "reset_done": "アクティビティログを消去しました。新しいジョブを開始できます。",
+        "reset_failed": "アクティビティログを消去できませんでした:\n{error}",
     },
 }
 
@@ -445,6 +497,12 @@ LINE_DEVICE_ID = os.environ.get("LINE_DEVICE_ID")
 # A claim.json older than this (and not marked published) is treated as left
 # behind by a crashed merge and may be taken over.
 PENDING_CLAIM_STALE_SEC = float(os.environ.get("PENDING_CLAIM_STALE_SEC", "300"))
+
+# --- Supervisor modes (Force Pass / Reset Log) ---------------------------------
+SUPERVISOR_PASSWORD = os.environ.get("SUPERVISOR_PASSWORD", "gcl")
+
+# Counts may exceed the job quantity by at most this much (retries, rework).
+OVER_LIMIT = 10
 
 _APP_START_MONOTONIC = time.monotonic()
 
@@ -865,6 +923,8 @@ class LogAnalyzerApp:
         self.root.geometry("620x640")
         self.root.minsize(560, 600)
         self.file_path = None
+        # Force Pass: armed by a supervisor for the next submit only.
+        self.force_pass = False
 
         # (widget, font_size, bold) — re-fonted when the language changes,
         # since Japanese needs a different font family than English.
@@ -1033,6 +1093,8 @@ class LogAnalyzerApp:
         self.browse_button.configure(text=self.t("browse"))
 
         self.analyze_button.configure(text=self.t("analyze_btn"))
+        self.reset_button.configure(text=self.t("reset_btn"))
+        self._render_force_button()
 
         self._render_mqtt_status()
 
@@ -1169,6 +1231,26 @@ class LogAnalyzerApp:
             bootstyle=SUCCESS,
         )
         self.analyze_button.pack(fill=X, ipady=10)
+
+        # --- Supervisor modes (password protected) --------------------------
+        supervisor = tb.Frame(container)
+        supervisor.pack(fill=X, pady=(10, 0))
+        supervisor.columnconfigure(0, weight=1)
+        supervisor.columnconfigure(1, weight=1)
+
+        self.force_button = tb.Button(
+            supervisor,
+            command=self.toggle_force_pass,
+            bootstyle=(WARNING, OUTLINE),
+        )
+        self.force_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.reset_button = tb.Button(
+            supervisor,
+            command=self.reset_activity_log,
+            bootstyle=(DANGER, OUTLINE),
+        )
+        self.reset_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
     @staticmethod
     def _validate_job_number(proposed):
@@ -1313,6 +1395,80 @@ class LogAnalyzerApp:
         self.role_menu.configure(state="readonly")
 
     # ------------------------------------------------------------------
+    # Supervisor modes
+    # ------------------------------------------------------------------
+    def _ask_password(self, mode_key):
+        """Return True if the supervisor password was entered correctly."""
+        pw = simpledialog.askstring(
+            self.t("password_title"),
+            self.t("password_prompt", mode=self.t(mode_key)),
+            show="*",
+            parent=self.root,
+        )
+        if pw is None:
+            return False  # cancelled
+        if pw != SUPERVISOR_PASSWORD:
+            messagebox.showerror(self.t("password_title"), self.t("password_wrong"))
+            return False
+        return True
+
+    def _render_force_button(self):
+        if self.force_pass:
+            self.force_button.configure(text=self.t("force_btn_on"), bootstyle=WARNING)
+        else:
+            self.force_button.configure(
+                text=self.t("force_btn"), bootstyle=(WARNING, OUTLINE)
+            )
+
+    def toggle_force_pass(self):
+        if self.force_pass:
+            # Cancelling never needs the password.
+            self.force_pass = False
+            self._render_force_button()
+            messagebox.showinfo(self.t("force_mode"), self.t("force_cancelled"))
+            return
+        if not self._ask_password("force_mode"):
+            return
+        self.force_pass = True
+        self._render_force_button()
+        messagebox.showwarning(self.t("force_mode"), self.t("force_armed_msg"))
+
+    def _consume_force_pass(self):
+        """Take the armed Force Pass for this submit and disarm it."""
+        forced = self.force_pass
+        self.force_pass = False
+        self._render_force_button()
+        return forced
+
+    def reset_activity_log(self):
+        if not self._ask_password("reset_mode"):
+            return
+        if not self.file_path:
+            messagebox.showwarning(self.t("no_file_title"), self.t("no_file_msg"))
+            return
+        if not messagebox.askyesno(
+            self.t("reset_mode"), self.t("reset_confirm", path=self.file_path)
+        ):
+            return
+        try:
+            # Truncate instead of delete so the programming tool can keep
+            # appending to the same file.
+            if os.path.exists(self.file_path):
+                os.chmod(self.file_path, stat.S_IWRITE | stat.S_IREAD)
+            with open(self.file_path, "w"):
+                pass
+        except Exception as e:
+            messagebox.showerror(
+                self.t("reset_mode"),
+                self.t("reset_failed", error=f"{type(e).__name__} - {e}"),
+            )
+            return
+        self.file_label.configure(
+            text=os.path.basename(self.file_path), bootstyle=DEFAULT
+        )
+        messagebox.showinfo(self.t("reset_mode"), self.t("reset_done"))
+
+    # ------------------------------------------------------------------
     # Analysis + publish
     # ------------------------------------------------------------------
     def read_and_analyze_log(self):
@@ -1329,7 +1485,14 @@ class LogAnalyzerApp:
         return programmed_count, verified_count
 
     def post_to_database(
-        self, job, job_quantity, programmed, verified, storage_bucket, storage_path
+        self,
+        job,
+        job_quantity,
+        programmed,
+        verified,
+        storage_bucket,
+        storage_path,
+        forced=False,
     ):
         """
         Publish an analytics.metrics row over MQTT to EMQX (fire-and-forget).
@@ -1356,6 +1519,8 @@ class LogAnalyzerApp:
                 "storage_path": storage_path,
             },
         }
+        if forced:
+            row["status"]["force_pass"] = True
 
         success, error = mqtt_client.publish(row)
 
@@ -1390,8 +1555,10 @@ class LogAnalyzerApp:
             return
         job_quantity = int(job_quantity)
 
+        forced = self._consume_force_pass()
+
         if self.is_split:
-            self._start_split_submit(job, job_quantity)
+            self._start_split_submit(job, job_quantity, forced)
             return
 
         programmed, verified = self.read_and_analyze_log()
@@ -1415,8 +1582,13 @@ class LogAnalyzerApp:
             failure_key = "cond_programmed_low"
         elif verified < job_quantity:
             failure_key = "cond_verified_low"
-        elif programmed > job_quantity + 10 or verified > job_quantity + 10:
+        elif not forced and (
+            programmed > job_quantity + OVER_LIMIT
+            or verified > job_quantity + OVER_LIMIT
+        ):
             failure_key = "cond_diff_high"
+        if forced:
+            result_message += self.t("force_applied") + "\n"
 
         if failure_key:
             result_message += "\n" + self.t(failure_key)
@@ -1428,12 +1600,12 @@ class LogAnalyzerApp:
 
         threading.Thread(
             target=self._publish_and_upload_worker,
-            args=(job, job_quantity, programmed, verified, result_message),
+            args=(job, job_quantity, programmed, verified, result_message, forced),
             daemon=True,
         ).start()
 
     def _publish_and_upload_worker(
-        self, job, job_quantity, programmed, verified, result_message
+        self, job, job_quantity, programmed, verified, result_message, forced=False
     ):
         """
         Runs off the main thread. Storage upload first; MQTT publish only if
@@ -1489,6 +1661,7 @@ class LogAnalyzerApp:
             verified,
             SUPABASE_STORAGE_BUCKET,
             storage_file_name,
+            forced,
         )
 
         if not post_success:
@@ -1522,7 +1695,7 @@ class LogAnalyzerApp:
     # ------------------------------------------------------------------
     # Two-station mode
     # ------------------------------------------------------------------
-    def _start_split_submit(self, job, job_quantity):
+    def _start_split_submit(self, job, job_quantity, forced=False):
         # Read every Tk value here on the main thread; the worker never
         # touches widgets directly.
         details = {
@@ -1530,6 +1703,7 @@ class LogAnalyzerApp:
             "model_name": self.model_name_entry.get().strip(),
             "product_code": self.product_code_entry.get().strip(),
             "device_name": self.device_name_entry.get().strip(),
+            "force_pass": forced,
         }
         self._show_loading(self.t("loading_part"))
         self.analyze_button.configure(state=DISABLED)
@@ -1592,8 +1766,10 @@ class LogAnalyzerApp:
         failure_key = None
         if count < qty:
             failure_key = "cond_own_low"
-        elif count > qty + 10:
+        elif count > qty + OVER_LIMIT and not details.get("force_pass"):
             failure_key = "cond_own_high"
+        if details.get("force_pass"):
+            lines.append(self.t("force_applied"))
         if failure_key:
             msg = "\n".join(lines) + "\n\n" + self.t(failure_key, role=role_name)
             self._finish_on_ui(self.t("cond_not_met_title"), msg, CLOSE_ICON)
@@ -1717,6 +1893,8 @@ class LogAnalyzerApp:
         programmed = count_keyword(program_log, ROLE_PROGRAM)
         verified = count_keyword(verify_log, ROLE_VERIFY)
         qty = int(meta["job_quantity"])
+        # Either station's supervisor may have forced its half.
+        forced = bool(meta.get("force_pass") or partner_meta.get("force_pass"))
 
         lines = lines + [
             "",
@@ -1729,7 +1907,7 @@ class LogAnalyzerApp:
             failure_key = "cond_programmed_low"
         elif verified < qty:
             failure_key = "cond_verified_low"
-        elif programmed > qty + 10 or verified > qty + 10:
+        elif not forced and (programmed > qty + OVER_LIMIT or verified > qty + OVER_LIMIT):
             failure_key = "cond_diff_high"
         if failure_key:
             release_claim(job)
@@ -1766,6 +1944,7 @@ class LogAnalyzerApp:
                 "storage_bucket": SUPABASE_STORAGE_BUCKET,
                 "storage_path": storage_path,
                 "mode": "two_station",
+                **({"force_pass": True} if forced else {}),
                 "stations": {
                     ROLE_PROGRAM: station(program_meta),
                     ROLE_VERIFY: station(verify_meta),
